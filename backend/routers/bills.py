@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from datetime import date, datetime
 import calendar
 
@@ -31,42 +31,124 @@ def _compute_next_due(due_day: int) -> date:
 
 
 def _add_due(bill: Bill) -> BillOut:
-    d = {c.name: getattr(bill, c.name) for c in bill.__table__.columns}
-    d['next_due_date'] = _compute_next_due(bill.due_day) if bill.is_active else None
-    return BillOut(**d)
+    out = BillOut.model_validate(bill)
+    if bill.due_day:
+        out.due_date = str(_compute_next_due(bill.due_day))
+    return out
 
 
 @router.get("/", response_model=List[BillOut])
-def list_bills(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    bills = db.query(Bill).filter(Bill.user_id == current_user.id).order_by(Bill.due_day).all()
-    return [_add_due(b) for b in bills]
+def list_bills(
+    is_paid: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    q = db.query(Bill).filter(
+        Bill.owner_id == current_user.id,
+        Bill.is_active == True
+    )
+    if is_paid is not None:
+        q = q.filter(Bill.is_paid == is_paid)
+    return [_add_due(b) for b in q.order_by(Bill.due_day).all()]
 
 
 @router.post("/", response_model=BillOut, status_code=status.HTTP_201_CREATED)
-def create_bill(payload: BillCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    bill = Bill(user_id=current_user.id, **payload.model_dump())
+def create_bill(
+    payload: BillCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = Bill(owner_id=current_user.id, **payload.model_dump())
     db.add(bill)
     db.commit()
     db.refresh(bill)
     return _add_due(bill)
 
 
-@router.put("/{bill_id}", response_model=BillOut)
-def update_bill(bill_id: int, payload: BillUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    bill = db.query(Bill).filter(Bill.id == bill_id, Bill.user_id == current_user.id).first()
+@router.get("/{bill_id}", response_model=BillOut)
+def get_bill(
+    bill_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(Bill).filter(
+        Bill.id == bill_id,
+        Bill.owner_id == current_user.id
+    ).first()
     if not bill:
         raise HTTPException(status_code=404, detail="Bill not found")
-    for field, value in payload.model_dump(exclude_none=True).items():
-        setattr(bill, field, value)
+    return _add_due(bill)
+
+
+@router.put("/{bill_id}", response_model=BillOut)
+def update_bill(
+    bill_id: int,
+    payload: BillUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(Bill).filter(
+        Bill.id == bill_id,
+        Bill.owner_id == current_user.id
+    ).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill not found")
+    for k, v in payload.model_dump(exclude_unset=True).items():
+        setattr(bill, k, v)
+    db.commit()
+    db.refresh(bill)
+    return _add_due(bill)
+
+
+@router.post("/{bill_id}/pay", response_model=BillOut)
+def mark_bill_paid(
+    bill_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(Bill).filter(
+        Bill.id == bill_id,
+        Bill.owner_id == current_user.id
+    ).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill not found")
+    bill.is_paid = True
+    bill.paid_at = datetime.utcnow()
+    db.commit()
+    db.refresh(bill)
+    return _add_due(bill)
+
+
+@router.post("/{bill_id}/unpay", response_model=BillOut)
+def mark_bill_unpaid(
+    bill_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(Bill).filter(
+        Bill.id == bill_id,
+        Bill.owner_id == current_user.id
+    ).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill not found")
+    bill.is_paid = False
+    bill.paid_at = None
     db.commit()
     db.refresh(bill)
     return _add_due(bill)
 
 
 @router.delete("/{bill_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_bill(bill_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    bill = db.query(Bill).filter(Bill.id == bill_id, Bill.user_id == current_user.id).first()
+def delete_bill(
+    bill_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    bill = db.query(Bill).filter(
+        Bill.id == bill_id,
+        Bill.owner_id == current_user.id
+    ).first()
     if not bill:
         raise HTTPException(status_code=404, detail="Bill not found")
-    db.delete(bill)
+    bill.is_active = False
     db.commit()
